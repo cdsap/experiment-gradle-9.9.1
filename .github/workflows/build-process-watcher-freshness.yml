@@ -19,7 +19,7 @@ on:
         default: https://process-watcher.web.app
         type: string
       experiment_ref:
-        description: Experiment git ref to build (baseline or gradle-9.9.1)
+        description: Experiment git ref used for run labeling (baseline or gradle-9.9.1)
         required: false
         default: baseline
         type: choice
@@ -30,6 +30,11 @@ on:
         description: Monitor interval in seconds
         required: false
         default: '1'
+        type: string
+      run_seconds:
+        description: Synthetic GradleDaemon runtime in seconds
+        required: false
+        default: '180'
         type: string
 
 permissions:
@@ -43,7 +48,7 @@ jobs:
   build:
     name: Live freshness ${{ inputs.experiment_ref }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     outputs:
       bpw_run_id: ${{ steps.record.outputs.bpw_run_id }}
       backend_url: ${{ steps.record.outputs.backend_url }}
@@ -67,20 +72,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '23'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
-
-      - name: Install Android platform 37
-        run: sdkmanager "platforms;android-37"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Prepare configured GC log directory
-        run: mkdir -p /home/runner/work/Telltale/Telltale
 
       - name: Start live freshness diagnostics
         id: watcher
@@ -116,8 +107,39 @@ jobs:
           test -n "$FRONTEND_URL"
           echo "Freshness-only remote mode confirmed for $RUN_ID"
 
-      - name: Run Android build
-        run: ./gradlew :app:app:assembleDebug --no-daemon --no-build-cache --stacktrace
+      # Real :app:app:assembleDebug needs platforms;android-37, which is not
+      # published on the default SDK channel yet. Use the same synthetic
+      # GradleDaemon pattern as Build Process Watcher's predictive contract smoke
+      # so this workflow can still exercise live GCP freshness timings.
+      - name: Run synthetic GradleDaemon workload
+        env:
+          RUN_SECONDS: ${{ inputs.run_seconds }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$RUN_SECONDS" =~ ^[0-9]+$ ]] || [ "$RUN_SECONDS" -lt 60 ]; then
+            echo "run_seconds must be an integer >= 60."
+            exit 1
+          fi
+
+          cat > GradleDaemon.java <<'EOF'
+          public class GradleDaemon {
+            public static void main(String[] args) throws Exception {
+              long end = System.currentTimeMillis() + (Long.parseLong(args[0]) * 1000L);
+              byte[][] retained = new byte[16][];
+              int i = 0;
+              while (System.currentTimeMillis() < end) {
+                retained[i % retained.length] = new byte[1024 * 1024];
+                Math.sqrt(System.nanoTime());
+                Thread.sleep(250);
+                i++;
+              }
+            }
+          }
+          EOF
+
+          javac GradleDaemon.java
+          java GradleDaemon "$RUN_SECONDS"
 
       - name: Record Build Process Watcher run
         id: record
