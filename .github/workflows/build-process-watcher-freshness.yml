@@ -69,7 +69,9 @@ jobs:
           java-version: '23'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       - name: Install Android platform 37
         run: sdkmanager "platforms;android-37"
@@ -119,7 +121,7 @@ jobs:
 
       - name: Record Build Process Watcher run
         id: record
-        if: always()
+        if: always() && steps.watcher.outputs.run_id != ''
         env:
           RUN_ID: ${{ steps.watcher.outputs.run_id }}
           BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
@@ -139,7 +141,7 @@ jobs:
             > freshness-runs/run.json
 
       - name: Upload Build Process Watcher run
-        if: always()
+        if: always() && steps.watcher.outputs.run_id != ''
         uses: actions/upload-artifact@v4
         with:
           name: freshness-run-${{ inputs.experiment_ref }}
