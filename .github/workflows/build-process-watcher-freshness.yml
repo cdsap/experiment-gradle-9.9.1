@@ -1,0 +1,307 @@
+name: Build Process Watcher freshness smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_ref:
+        description: Build Process Watcher ref with freshness_diagnostics support
+        required: false
+        default: 44112e5f2d71e35834624e0a170ba609db330328
+        type: string
+      backend_url:
+        description: Public Build Process Watcher backend URL
+        required: false
+        default: https://build-process-watcher-backend-685615422311.us-central1.run.app
+        type: string
+      frontend_url:
+        description: Public Build Process Watcher frontend base URL
+        required: false
+        default: https://process-watcher.web.app
+        type: string
+      experiment_ref:
+        description: Experiment git ref to build (baseline or gradle-9.9.1)
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - gradle-9.9.1
+      interval:
+        description: Monitor interval in seconds
+        required: false
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bpw-freshness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Live freshness ${{ inputs.experiment_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      bpw_run_id: ${{ steps.record.outputs.bpw_run_id }}
+      backend_url: ${{ steps.record.outputs.backend_url }}
+      frontend_url: ${{ steps.record.outputs.frontend_url }}
+
+    steps:
+      - name: Check out experiment
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.experiment_ref }}
+
+      - name: Check out Build Process Watcher
+        uses: actions/checkout@v4
+        with:
+          repository: cdsap/build-process-watcher
+          ref: ${{ inputs.action_ref }}
+          path: bpw-action
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform 37
+        run: sdkmanager "platforms;android-37"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare configured GC log directory
+        run: mkdir -p /home/runner/work/Telltale/Telltale
+
+      - name: Start live freshness diagnostics
+        id: watcher
+        uses: ./bpw-action
+        env:
+          BACKEND_URL: ${{ inputs.backend_url }}
+          FRONTEND_URL: ${{ inputs.frontend_url }}
+        with:
+          freshness_diagnostics: 'true'
+          interval: ${{ inputs.interval }}
+          debug: 'true'
+          run_id: freshness-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.experiment_ref }}
+
+      - name: Assert freshness-only remote mode
+        env:
+          REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
+          FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
+          PREDICTIVE: ${{ steps.watcher.outputs.predictive_reliability }}
+          PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
+          EXPORT_BQ: ${{ steps.watcher.outputs.export_to_bigquery }}
+          RUN_ID: ${{ steps.watcher.outputs.run_id }}
+          BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
+          FRONTEND_URL: ${{ steps.watcher.outputs.frontend_url }}
+        run: |
+          set -euo pipefail
+          test "$REMOTE" = "true"
+          test "$FRESHNESS" = "true"
+          test "$PREDICTIVE" = "false"
+          test "${PREDICTION_MODE:-disabled}" = "disabled"
+          test "$EXPORT_BQ" = "false"
+          test -n "$RUN_ID"
+          test -n "$BACKEND_URL"
+          test -n "$FRONTEND_URL"
+          echo "Freshness-only remote mode confirmed for $RUN_ID"
+
+      - name: Run Android build
+        run: ./gradlew :app:app:assembleDebug --no-daemon --no-build-cache --stacktrace
+
+      - name: Record Build Process Watcher run
+        id: record
+        if: always()
+        env:
+          RUN_ID: ${{ steps.watcher.outputs.run_id }}
+          BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
+          FRONTEND_URL: ${{ steps.watcher.outputs.frontend_url }}
+        run: |
+          set -euo pipefail
+          echo "bpw_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "backend_url=$BACKEND_URL" >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$FRONTEND_URL" >> "$GITHUB_OUTPUT"
+          mkdir -p freshness-runs
+          jq -n \
+            --arg label "${{ inputs.experiment_ref }}" \
+            --arg run_id "$RUN_ID" \
+            --arg backend_url "$BACKEND_URL" \
+            --arg frontend_url "$FRONTEND_URL" \
+            '{label: $label, run_id: $run_id, backend_url: $backend_url, frontend_url: $frontend_url}' \
+            > freshness-runs/run.json
+
+      - name: Upload Build Process Watcher run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshness-run-${{ inputs.experiment_ref }}
+          path: freshness-runs/run.json
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Verify live freshness data
+    if: always() && needs.build.outputs.bpw_run_id != ''
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: chrome
+
+      - name: Verify backend timing data and dashboard rendering
+        env:
+          BPW_RUN_ID: ${{ needs.build.outputs.bpw_run_id }}
+          BACKEND_URL: ${{ needs.build.outputs.backend_url }}
+          FRONTEND_URL: ${{ needs.build.outputs.frontend_url }}
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          EXPERIMENT_REF: ${{ inputs.experiment_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_json="$RUNNER_TEMP/freshness-run.json"
+          verified=false
+
+          for attempt in {1..36}; do
+            if curl --fail --silent --show-error "$BACKEND_URL/runs/$BPW_RUN_ID" > "$run_json"; then
+              if jq -e '
+                .finished == true
+                and (.samples | type == "array" and length > 0)
+                and (
+                  (.prediction_checkpoints | type != "array")
+                  or (.prediction_checkpoints | length == 0)
+                )
+                and ([
+                  .samples[]
+                  | (.Freshness // .freshness // empty)
+                  | select(
+                      (.sample_id | type == "string" and length > 0)
+                      and (.sequence | type == "number")
+                      and (.collected_at_unix_ms | type == "number")
+                      and (.backend_received_at_unix_ms | type == "number")
+                      and (.backend_stored_at_unix_ms | type == "number")
+                      and (.backend_storage_duration_ms | type == "number")
+                      and (.backend_storage_duration_ms >= 0)
+                      and (.backend_received_at_unix_ms >= .collected_at_unix_ms - 100)
+                      and (.backend_stored_at_unix_ms >= .backend_received_at_unix_ms - 100)
+                    )
+                ] | length > 0)
+              ' "$run_json" > /dev/null; then
+                verified=true
+                break
+              fi
+            fi
+
+            echo "Waiting for finalized freshness data (${attempt}/36)."
+            sleep 10
+          done
+
+          if [ "$verified" != true ]; then
+            echo "No finalized freshness samples were stored for $BPW_RUN_ID."
+            jq '{
+              finished,
+              sample_count: (.samples | length),
+              freshness_samples: [.samples[]? | select(.Freshness or .freshness)] | length,
+              prediction_checkpoints: (.prediction_checkpoints // [])
+            }' "$run_json" || true
+            exit 1
+          fi
+
+          timing_summary="$(jq -c '
+            [
+              .samples[]
+              | (.Freshness // .freshness // empty)
+              | select(.collected_at_unix_ms and .backend_received_at_unix_ms and .backend_stored_at_unix_ms and .backend_storage_duration_ms)
+              | {
+                  runner_to_backend_ms: (.backend_received_at_unix_ms - .collected_at_unix_ms),
+                  backend_storage_duration_ms,
+                  runner_to_stored_ms: (.backend_stored_at_unix_ms - .collected_at_unix_ms)
+                }
+            ] as $rows
+            | def pct($values; $fraction):
+                ($values | sort) as $sorted
+                | if ($sorted | length) == 0 then null
+                  else $sorted[((($sorted | length) * $fraction) | ceil) - 1]
+                  end;
+            {
+              freshness_sample_count: ($rows | length),
+              runner_to_backend_p50_ms: pct([$rows[].runner_to_backend_ms]; 0.5),
+              runner_to_backend_p95_ms: pct([$rows[].runner_to_backend_ms]; 0.95),
+              backend_storage_p50_ms: pct([$rows[].backend_storage_duration_ms]; 0.5),
+              backend_storage_p95_ms: pct([$rows[].backend_storage_duration_ms]; 0.95),
+              runner_to_stored_p50_ms: pct([$rows[].runner_to_stored_ms]; 0.5),
+              runner_to_stored_p95_ms: pct([$rows[].runner_to_stored_ms]; 0.95)
+            }
+          ' "$run_json")"
+
+          echo "Timing summary: $timing_summary"
+          jq -e '
+            .freshness_sample_count > 0
+            and .runner_to_backend_p50_ms != null
+            and .backend_storage_p50_ms != null
+          ' <<<"$timing_summary" > /dev/null
+
+          # Action frontend_url output is already the run dashboard URL.
+          if [[ "$FRONTEND_URL" == */runs/* ]]; then
+            dashboard_url="$FRONTEND_URL"
+          else
+            dashboard_url="${FRONTEND_URL%/}/runs/$BPW_RUN_ID"
+          fi
+          dashboard_dom="$RUNNER_TEMP/freshness-dashboard.html"
+          timeout 60s "$CHROME_PATH" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --virtual-time-budget=20000 \
+            --dump-dom \
+            "$dashboard_url" > "$dashboard_dom"
+
+          if ! grep -q 'Live freshness' "$dashboard_dom"; then
+            echo "The live dashboard did not render freshness diagnostics for $BPW_RUN_ID."
+            exit 1
+          fi
+
+          for label in \
+            'End-to-end p50' \
+            'End-to-end p95' \
+            'Runner → backend p95' \
+            'Backend store p95' \
+            'Store → first display p95' \
+            'Dashboard fetch + render'
+          do
+            if ! grep -Fq "$label" "$dashboard_dom"; then
+              echo "Missing dashboard timing label: $label"
+              exit 1
+            fi
+          done
+
+          # Freshness-only runs are the no-checkpoint case for marker rendering.
+          if ! grep -Eq 'No prediction checkpoints|This legacy run does not contain prediction checkpoints' "$dashboard_dom"; then
+            echo "Expected the empty prediction-checkpoint state on a freshness-only run."
+            exit 1
+          fi
+
+          {
+            echo "### Live freshness smoke"
+            echo
+            echo "- Experiment ref: \`$EXPERIMENT_REF\`"
+            echo "- Run: [$BPW_RUN_ID]($dashboard_url)"
+            echo "- Stored freshness samples: $(jq -r '.freshness_sample_count' <<<"$timing_summary")"
+            echo "- Runner → backend p50/p95: $(jq -r '"\(.runner_to_backend_p50_ms)/\(.runner_to_backend_p95_ms) ms"' <<<"$timing_summary")"
+            echo "- Backend store p50/p95: $(jq -r '"\(.backend_storage_p50_ms)/\(.backend_storage_p95_ms) ms"' <<<"$timing_summary")"
+            echo "- Runner → stored p50/p95: $(jq -r '"\(.runner_to_stored_p50_ms)/\(.runner_to_stored_p95_ms) ms"' <<<"$timing_summary")"
+            echo "- Prediction checkpoints: none (empty dashboard state confirmed)"
+            echo "- Dashboard freshness panel rendered: yes"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
