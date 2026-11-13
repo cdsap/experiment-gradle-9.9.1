@@ -1,0 +1,238 @@
+name: Build Process Watcher forecast smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_ref:
+        description: Build Process Watcher ref with prediction_mode=forecast support
+        required: false
+        default: main
+        type: string
+      backend_url:
+        description: Public Build Process Watcher backend URL
+        required: false
+        default: https://build-process-watcher-backend-685615422311.us-central1.run.app
+        type: string
+      frontend_url:
+        description: Public Build Process Watcher frontend base URL
+        required: false
+        default: https://process-watcher.web.app
+        type: string
+      experiment_ref:
+        description: Experiment git ref used for run labeling
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - gradle-9.9.1
+      interval:
+        description: Monitor interval in seconds
+        required: false
+        default: '1'
+        type: string
+      gradle_task:
+        description: Gradle task used as the monitored workload
+        required: false
+        default: :app:app:assembleDebug
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bpw-forecast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Live forecast ${{ inputs.experiment_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      bpw_run_id: ${{ steps.record.outputs.bpw_run_id }}
+      backend_url: ${{ steps.record.outputs.backend_url }}
+      frontend_url: ${{ steps.record.outputs.frontend_url }}
+
+    steps:
+      - name: Check out experiment
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.experiment_ref }}
+
+      - name: Check out Build Process Watcher
+        uses: actions/checkout@v4
+        with:
+          repository: cdsap/build-process-watcher
+          ref: ${{ inputs.action_ref }}
+          path: bpw-action
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android platform for compileSdk 37
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-37.0"
+          if [ -d "$ANDROID_HOME/platforms/android-37.0" ] && [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s android-37.0 "$ANDROID_HOME/platforms/android-37"
+          fi
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare configured GC log directory
+        run: mkdir -p /home/runner/work/Telltale/Telltale
+
+      - name: Start live forecast diagnostics
+        id: watcher
+        uses: ./bpw-action
+        env:
+          BACKEND_URL: ${{ inputs.backend_url }}
+          FRONTEND_URL: ${{ inputs.frontend_url }}
+        with:
+          freshness_diagnostics: 'true'
+          prediction_mode: forecast
+          interval: ${{ inputs.interval }}
+          debug: 'true'
+          run_id: forecast-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.experiment_ref }}
+
+      - name: Assert forecast remote mode
+        env:
+          REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
+          FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
+          PREDICTIVE: ${{ steps.watcher.outputs.predictive_reliability }}
+          PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
+          EXPORT_BQ: ${{ steps.watcher.outputs.export_to_bigquery }}
+          RUN_ID: ${{ steps.watcher.outputs.run_id }}
+          BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
+          FRONTEND_URL: ${{ steps.watcher.outputs.frontend_url }}
+        run: |
+          set -euo pipefail
+          test "$REMOTE" = "true"
+          test "$FRESHNESS" = "true"
+          test "$PREDICTIVE" = "false"
+          test "${PREDICTION_MODE:-disabled}" = "forecast"
+          test "$EXPORT_BQ" = "false"
+          test -n "$RUN_ID"
+          test -n "$BACKEND_URL"
+          test -n "$FRONTEND_URL"
+          echo "Freshness + forecast mode confirmed for $RUN_ID"
+
+      - name: Run Android assembleDebug
+        env:
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+        run: ./gradlew "$GRADLE_TASK" --no-daemon --no-build-cache --stacktrace
+
+      - name: Record Build Process Watcher run
+        id: record
+        if: always() && steps.watcher.outputs.run_id != ''
+        env:
+          RUN_ID: ${{ steps.watcher.outputs.run_id }}
+          BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
+          FRONTEND_URL: ${{ steps.watcher.outputs.frontend_url }}
+        run: |
+          set -euo pipefail
+          echo "bpw_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "backend_url=$BACKEND_URL" >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$FRONTEND_URL" >> "$GITHUB_OUTPUT"
+          mkdir -p forecast-runs
+          jq -n \
+            --arg label "${{ inputs.experiment_ref }}" \
+            --arg run_id "$RUN_ID" \
+            --arg backend_url "$BACKEND_URL" \
+            --arg frontend_url "$FRONTEND_URL" \
+            '{label: $label, run_id: $run_id, backend_url: $backend_url, frontend_url: $frontend_url}' \
+            > forecast-runs/run.json
+
+      - name: Upload Build Process Watcher run
+        if: always() && steps.watcher.outputs.run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-run-${{ inputs.experiment_ref }}
+          path: forecast-runs/run.json
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Verify live forecast issuances
+    if: always() && needs.build.outputs.bpw_run_id != ''
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Verify backend process_forecasts
+        env:
+          BPW_RUN_ID: ${{ needs.build.outputs.bpw_run_id }}
+          BACKEND_URL: ${{ needs.build.outputs.backend_url }}
+          FRONTEND_URL: ${{ needs.build.outputs.frontend_url }}
+        run: |
+          set -euo pipefail
+          run_json="$RUNNER_TEMP/forecast-run.json"
+          verified=false
+
+          for attempt in {1..36}; do
+            if curl --fail --silent --show-error "$BACKEND_URL/runs/$BPW_RUN_ID" > "$run_json"; then
+              if jq -e '
+                .finished == true
+                and (.samples | type == "array" and length > 0)
+                and ((.prediction_checkpoints // []) | length == 0)
+                and ((.process_forecasts // []) | length > 0)
+                and all(.process_forecasts[] as $forecast;
+                  ($forecast.process_name | type == "string" and ($forecast.process_name | length) > 0)
+                  and ($forecast.pid | type == "string" and ($forecast.pid | length) > 0)
+                  and ($forecast.metric == "heap" or $forecast.metric == "rss")
+                  and ($forecast.created_at_ms | type == "number")
+                  and (($forecast.points // []) | length > 0)
+                  and all($forecast.points[];
+                    (.target_at_ms | type == "number")
+                    and (.value_mb | type == "number")
+                    and (.target_at_ms >= $forecast.created_at_ms)
+                  )
+                )
+              ' "$run_json" > /dev/null; then
+                verified=true
+                break
+              fi
+            fi
+            echo "Waiting for finalized forecast issuances (${attempt}/36)."
+            sleep 10
+          done
+
+          if [ "$verified" != true ]; then
+            echo "No finalized process_forecasts for $BPW_RUN_ID."
+            jq '{
+              finished,
+              sample_count: (.samples | length),
+              prediction_checkpoints: (.prediction_checkpoints // [] | length),
+              process_forecasts: [.process_forecasts[]? | {process_name, pid, metric, created_at_ms, points: (.points|length)}]
+            }' "$run_json" || true
+            exit 1
+          fi
+
+          summary="$(jq -c '{
+            finished,
+            sample_count: (.samples | length),
+            forecast_count: (.process_forecasts | length),
+            metrics: [.process_forecasts[] | .metric] | unique,
+            processes: [.process_forecasts[] | .process_name] | unique,
+            checkpoints: (.prediction_checkpoints // [] | length)
+          }' "$run_json")"
+          echo "Forecast summary: $summary"
+
+          dashboard_url="${FRONTEND_URL%/}/runs/$BPW_RUN_ID"
+          echo "## Forecast smoke"
+          echo "- Run: [$BPW_RUN_ID]($dashboard_url)"
+          echo "- Forecast issuances: $(jq -r '.forecast_count' <<<"$summary")"
+          echo "- Processes: $(jq -r '.processes | join(", ")' <<<"$summary")"
+          echo "- Metrics: $(jq -r '.metrics | join(", ")' <<<"$summary")"
+          echo "- Reliability checkpoints: $(jq -r '.checkpoints' <<<"$summary") (expect 0)"
