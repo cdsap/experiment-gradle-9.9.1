@@ -31,10 +31,10 @@ on:
         required: false
         default: '1'
         type: string
-      run_seconds:
-        description: Synthetic GradleDaemon runtime in seconds (must cover expected_checkpoints)
+      gradle_task:
+        description: Gradle task used as the monitored workload
         required: false
-        default: '200'
+        default: :app:app:assembleDebug
         type: string
       expected_checkpoints:
         description: Ready checkpoint windows to require (production currently uses 30,60,180)
@@ -53,7 +53,7 @@ jobs:
   build:
     name: Live freshness ${{ inputs.experiment_ref }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     outputs:
       bpw_run_id: ${{ steps.record.outputs.bpw_run_id }}
       backend_url: ${{ steps.record.outputs.backend_url }}
@@ -77,6 +77,27 @@ jobs:
         with:
           distribution: temurin
           java-version: '23'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android platform for compileSdk 37
+        run: |
+          set -euo pipefail
+          # compileSdk=37 resolves to the 37.0 platform package, not platforms;android-37.
+          sdkmanager "platforms;android-37.0"
+          if [ -d "$ANDROID_HOME/platforms/android-37.0" ] && [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s android-37.0 "$ANDROID_HOME/platforms/android-37"
+          fi
+          ls -la "$ANDROID_HOME/platforms"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare configured GC log directory
+        run: mkdir -p /home/runner/work/Telltale/Telltale
 
       - name: Start live freshness and prediction diagnostics
         id: watcher
@@ -113,52 +134,10 @@ jobs:
           test -n "$FRONTEND_URL"
           echo "Freshness + predictive reliability mode confirmed for $RUN_ID"
 
-      # Real :app:app:assembleDebug needs platforms;android-37, which is not
-      # published on the default SDK channel yet. Use the same synthetic
-      # GradleDaemon pattern as Build Process Watcher's predictive contract smoke
-      # so this workflow can still exercise live GCP freshness + predictions.
-      - name: Run synthetic GradleDaemon workload
+      - name: Run Android assembleDebug
         env:
-          RUN_SECONDS: ${{ inputs.run_seconds }}
-          EXPECTED_CHECKPOINTS: ${{ inputs.expected_checkpoints }}
-        run: |
-          set -euo pipefail
-
-          if ! [[ "$RUN_SECONDS" =~ ^[0-9]+$ ]] || [ "$RUN_SECONDS" -lt 60 ]; then
-            echo "run_seconds must be an integer >= 60."
-            exit 1
-          fi
-
-          max_checkpoint="$(printf '%s' "$EXPECTED_CHECKPOINTS" | jq -Rc '
-            split(",")
-            | map(gsub("^\\s+|\\s+$"; ""))
-            | map(select(length > 0))
-            | map(tonumber? // empty)
-            | max // 0
-          ')"
-          if [ "$RUN_SECONDS" -lt "$max_checkpoint" ]; then
-            echo "run_seconds ($RUN_SECONDS) must be >= largest expected checkpoint ($max_checkpoint)."
-            exit 1
-          fi
-
-          cat > GradleDaemon.java <<'EOF'
-          public class GradleDaemon {
-            public static void main(String[] args) throws Exception {
-              long end = System.currentTimeMillis() + (Long.parseLong(args[0]) * 1000L);
-              byte[][] retained = new byte[16][];
-              int i = 0;
-              while (System.currentTimeMillis() < end) {
-                retained[i % retained.length] = new byte[1024 * 1024];
-                Math.sqrt(System.nanoTime());
-                Thread.sleep(250);
-                i++;
-              }
-            }
-          }
-          EOF
-
-          javac GradleDaemon.java
-          java GradleDaemon "$RUN_SECONDS"
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+        run: ./gradlew "$GRADLE_TASK" --no-daemon --no-build-cache --stacktrace
 
       - name: Record Build Process Watcher run
         id: record
