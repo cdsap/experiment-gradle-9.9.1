@@ -32,9 +32,14 @@ on:
         default: '1'
         type: string
       run_seconds:
-        description: Synthetic GradleDaemon runtime in seconds
+        description: Synthetic GradleDaemon runtime in seconds (must cover expected_checkpoints)
         required: false
-        default: '180'
+        default: '200'
+        type: string
+      expected_checkpoints:
+        description: Ready checkpoint windows to require (production currently uses 30,60,180)
+        required: false
+        default: 30,60,180
         type: string
 
 permissions:
@@ -48,7 +53,7 @@ jobs:
   build:
     name: Live freshness ${{ inputs.experiment_ref }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     outputs:
       bpw_run_id: ${{ steps.record.outputs.bpw_run_id }}
       backend_url: ${{ steps.record.outputs.backend_url }}
@@ -73,7 +78,7 @@ jobs:
           distribution: temurin
           java-version: '23'
 
-      - name: Start live freshness diagnostics
+      - name: Start live freshness and prediction diagnostics
         id: watcher
         uses: ./bpw-action
         env:
@@ -81,11 +86,12 @@ jobs:
           FRONTEND_URL: ${{ inputs.frontend_url }}
         with:
           freshness_diagnostics: 'true'
+          predictive_reliability: 'true'
           interval: ${{ inputs.interval }}
           debug: 'true'
           run_id: freshness-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.experiment_ref }}
 
-      - name: Assert freshness-only remote mode
+      - name: Assert freshness and prediction remote mode
         env:
           REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
           FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
@@ -99,26 +105,39 @@ jobs:
           set -euo pipefail
           test "$REMOTE" = "true"
           test "$FRESHNESS" = "true"
-          test "$PREDICTIVE" = "false"
-          test "${PREDICTION_MODE:-disabled}" = "disabled"
-          test "$EXPORT_BQ" = "false"
+          test "$PREDICTIVE" = "true"
+          test "${PREDICTION_MODE:-disabled}" = "reliability"
+          test "$EXPORT_BQ" = "true"
           test -n "$RUN_ID"
           test -n "$BACKEND_URL"
           test -n "$FRONTEND_URL"
-          echo "Freshness-only remote mode confirmed for $RUN_ID"
+          echo "Freshness + predictive reliability mode confirmed for $RUN_ID"
 
       # Real :app:app:assembleDebug needs platforms;android-37, which is not
       # published on the default SDK channel yet. Use the same synthetic
       # GradleDaemon pattern as Build Process Watcher's predictive contract smoke
-      # so this workflow can still exercise live GCP freshness timings.
+      # so this workflow can still exercise live GCP freshness + predictions.
       - name: Run synthetic GradleDaemon workload
         env:
           RUN_SECONDS: ${{ inputs.run_seconds }}
+          EXPECTED_CHECKPOINTS: ${{ inputs.expected_checkpoints }}
         run: |
           set -euo pipefail
 
           if ! [[ "$RUN_SECONDS" =~ ^[0-9]+$ ]] || [ "$RUN_SECONDS" -lt 60 ]; then
             echo "run_seconds must be an integer >= 60."
+            exit 1
+          fi
+
+          max_checkpoint="$(printf '%s' "$EXPECTED_CHECKPOINTS" | jq -Rc '
+            split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | map(tonumber? // empty)
+            | max // 0
+          ')"
+          if [ "$RUN_SECONDS" -lt "$max_checkpoint" ]; then
+            echo "run_seconds ($RUN_SECONDS) must be >= largest expected checkpoint ($max_checkpoint)."
             exit 1
           fi
 
@@ -172,7 +191,7 @@ jobs:
           retention-days: 7
 
   verify:
-    name: Verify live freshness data
+    name: Verify live freshness and predictions
     if: always() && needs.build.outputs.bpw_run_id != ''
     needs: build
     runs-on: ubuntu-latest
@@ -183,29 +202,40 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         id: chrome
 
-      - name: Verify backend timing data and dashboard rendering
+      - name: Verify backend timing, predictions, and dashboard rendering
         env:
           BPW_RUN_ID: ${{ needs.build.outputs.bpw_run_id }}
           BACKEND_URL: ${{ needs.build.outputs.backend_url }}
           FRONTEND_URL: ${{ needs.build.outputs.frontend_url }}
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
           EXPERIMENT_REF: ${{ inputs.experiment_ref }}
+          EXPECTED_CHECKPOINTS: ${{ inputs.expected_checkpoints }}
         shell: bash
         run: |
           set -euo pipefail
 
           run_json="$RUNNER_TEMP/freshness-run.json"
           verified=false
+          expected_checkpoints="$(jq -Rc '
+            split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+            | map(tonumber? // empty)
+            | sort
+          ' <<<"$EXPECTED_CHECKPOINTS")"
 
           for attempt in {1..36}; do
             if curl --fail --silent --show-error "$BACKEND_URL/runs/$BPW_RUN_ID" > "$run_json"; then
-              if jq -e '
+              if jq -e --argjson expected_checkpoints "$expected_checkpoints" '
                 .finished == true
                 and (.samples | type == "array" and length > 0)
-                and (
-                  (.prediction_checkpoints | type != "array")
-                  or (.prediction_checkpoints | length == 0)
-                )
+                and ([
+                  .prediction_checkpoints[]?
+                  | select(.status == "ready")
+                  | .observation_window_s
+                ] | sort) as $ready
+                | ($expected_checkpoints | sort) as $expected
+                | all($expected[]; . as $checkpoint | $ready | index($checkpoint))
                 and ([
                   .samples[]
                   | (.Freshness // .freshness // empty)
@@ -227,17 +257,17 @@ jobs:
               fi
             fi
 
-            echo "Waiting for finalized freshness data (${attempt}/36)."
+            echo "Waiting for finalized freshness + ready checkpoints (${attempt}/36)."
             sleep 10
           done
 
           if [ "$verified" != true ]; then
-            echo "No finalized freshness samples were stored for $BPW_RUN_ID."
+            echo "No finalized freshness samples with ready checkpoints for $BPW_RUN_ID."
             jq '{
               finished,
               sample_count: (.samples | length),
               freshness_samples: [.samples[]? | select(.Freshness or .freshness)] | length,
-              prediction_checkpoints: (.prediction_checkpoints // [])
+              checkpoints: [.prediction_checkpoints[]? | {window: .observation_window_s, status, message}]
             }' "$run_json" || true
             exit 1
           fi
@@ -269,7 +299,16 @@ jobs:
             }
           ' "$run_json")"
 
+          checkpoint_summary="$(jq -c --argjson expected_checkpoints "$expected_checkpoints" '
+            {
+              expected: $expected_checkpoints,
+              ready: [.prediction_checkpoints[]? | select(.status == "ready") | .observation_window_s] | sort,
+              checkpoints: [.prediction_checkpoints[]? | {window: .observation_window_s, status, risk: .risk_level, score: .risk_score}]
+            }
+          ' "$run_json")"
+
           echo "Timing summary: $timing_summary"
+          echo "Checkpoint summary: $checkpoint_summary"
           jq -e '
             .freshness_sample_count > 0
             and .runner_to_backend_p50_ms != null
@@ -310,14 +349,18 @@ jobs:
             fi
           done
 
-          # Freshness-only runs are the no-checkpoint case for marker rendering.
-          if ! grep -Eq 'No prediction checkpoints|This legacy run does not contain prediction checkpoints' "$dashboard_dom"; then
-            echo "Expected the empty prediction-checkpoint state on a freshness-only run."
+          if ! grep -Eq 'Prediction evaluation timeline|data-prediction-window|Prediction checkpoints' "$dashboard_dom"; then
+            echo "The live dashboard did not render prediction checkpoint markers for $BPW_RUN_ID."
+            exit 1
+          fi
+
+          if grep -Eq 'No prediction checkpoints|This legacy run does not contain prediction checkpoints' "$dashboard_dom"; then
+            echo "Dashboard still shows the empty prediction state; expected ready checkpoints."
             exit 1
           fi
 
           {
-            echo "### Live freshness smoke"
+            echo "### Live freshness + prediction smoke"
             echo
             echo "- Experiment ref: \`$EXPERIMENT_REF\`"
             echo "- Run: [$BPW_RUN_ID]($dashboard_url)"
@@ -325,7 +368,8 @@ jobs:
             echo "- Runner → backend p50/p95: $(jq -r '"\(.runner_to_backend_p50_ms)/\(.runner_to_backend_p95_ms) ms"' <<<"$timing_summary")"
             echo "- Backend store p50/p95: $(jq -r '"\(.backend_storage_p50_ms)/\(.backend_storage_p95_ms) ms"' <<<"$timing_summary")"
             echo "- Runner → stored p50/p95: $(jq -r '"\(.runner_to_stored_p50_ms)/\(.runner_to_stored_p95_ms) ms"' <<<"$timing_summary")"
-            echo "- Prediction checkpoints: none (empty dashboard state confirmed)"
+            echo "- Ready prediction checkpoints: $(jq -r '.ready | map(tostring) | join(", ")' <<<"$checkpoint_summary")"
             echo "- Dashboard freshness panel rendered: yes"
+            echo "- Dashboard prediction markers rendered: yes"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
