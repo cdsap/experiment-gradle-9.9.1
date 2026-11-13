@@ -187,18 +187,18 @@ jobs:
                 and (.samples | type == "array" and length > 0)
                 and ((.prediction_checkpoints // []) | length == 0)
                 and ((.process_forecasts // []) | length > 0)
-                and all(.process_forecasts[] as $forecast;
-                  ($forecast.process_name | type == "string" and ($forecast.process_name | length) > 0)
-                  and ($forecast.pid | type == "string" and ($forecast.pid | length) > 0)
-                  and ($forecast.metric == "heap" or $forecast.metric == "rss")
-                  and ($forecast.created_at_ms | type == "number")
-                  and (($forecast.points // []) | length > 0)
-                  and all($forecast.points[];
+                and ([.process_forecasts[] | . as $f | select(
+                  ($f.process_name | type == "string")
+                  and ($f.pid | type == "string")
+                  and ($f.metric == "heap" or $f.metric == "rss")
+                  and ($f.created_at_ms | type == "number")
+                  and (($f.points // []) | length > 0)
+                  and all($f.points[];
                     (.target_at_ms | type == "number")
                     and (.value_mb | type == "number")
-                    and (.target_at_ms >= $forecast.created_at_ms)
+                    and (.target_at_ms >= $f.created_at_ms)
                   )
-                )
+                )] | length) == (.process_forecasts | length)
               ' "$run_json" > /dev/null; then
                 verified=true
                 break
