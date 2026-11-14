@@ -6,7 +6,7 @@ on:
       action_ref:
         description: Build Process Watcher ref with prediction_mode=predict support
         required: false
-        default: main
+        default: fix/upload-monitor-debug-logs
         type: string
       backend_url:
         description: Public Build Process Watcher backend URL
