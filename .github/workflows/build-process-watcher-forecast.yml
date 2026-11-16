@@ -109,7 +109,6 @@ jobs:
         env:
           REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
           FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
-          PREDICTIVE: ${{ steps.watcher.outputs.predictive_reliability }}
           PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
           EXPORT_BQ: ${{ steps.watcher.outputs.export_to_bigquery }}
           RUN_ID: ${{ steps.watcher.outputs.run_id }}
@@ -119,7 +118,6 @@ jobs:
           set -euo pipefail
           test "$REMOTE" = "true"
           test "$FRESHNESS" = "true"
-          test "$PREDICTIVE" = "false"
           test "${PREDICTION_MODE:-disabled}" = "forecast"
           test "$EXPORT_BQ" = "false"
           test -n "$RUN_ID"
