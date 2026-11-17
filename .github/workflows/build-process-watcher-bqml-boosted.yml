@@ -31,6 +31,11 @@ on:
         required: false
         default: '1'
         type: string
+      prediction_throttle_s:
+        description: Process-forecast cadence in elapsed seconds (default 20)
+        required: false
+        default: '20'
+        type: string
       gradle_task:
         description: Gradle task used as the monitored workload
         required: false
@@ -101,6 +106,7 @@ jobs:
         with:
           freshness_diagnostics: 'true'
           prediction_mode: bqml-boosted
+          prediction_throttle_s: ${{ inputs.prediction_throttle_s }}
           interval: ${{ inputs.interval }}
           debug: 'true'
           run_id: bqml-boosted-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.experiment_ref }}
@@ -110,6 +116,7 @@ jobs:
           REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
           FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
           PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
+          PREDICTION_THROTTLE_S: ${{ steps.watcher.outputs.prediction_throttle_s }}
           EXPORT_BQ: ${{ steps.watcher.outputs.export_to_bigquery }}
           RUN_ID: ${{ steps.watcher.outputs.run_id }}
           BACKEND_URL: ${{ steps.watcher.outputs.backend_url }}
@@ -119,6 +126,7 @@ jobs:
           test "$REMOTE" = "true"
           test "$FRESHNESS" = "true"
           test "${PREDICTION_MODE:-disabled}" = "bqml-boosted"
+          test "${PREDICTION_THROTTLE_S:-}" = "${{ inputs.prediction_throttle_s }}"
           test "$EXPORT_BQ" = "false"
           test -n "$RUN_ID"
           test -n "$BACKEND_URL"
