@@ -31,6 +31,14 @@ on:
         required: false
         default: '1'
         type: string
+      prediction_target:
+        description: Prediction target (class loading uses the separate experimental model)
+        required: false
+        default: memory
+        type: choice
+        options:
+          - memory
+          - class_loading
       prediction_throttle_s:
         description: Process-forecast cadence in elapsed seconds (default 20)
         required: false
@@ -51,7 +59,7 @@ concurrency:
 
 jobs:
   build:
-    name: Live forecast ${{ inputs.experiment_ref }}
+    name: Live forecast ${{ inputs.prediction_target }} ${{ inputs.experiment_ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
@@ -106,6 +114,8 @@ jobs:
         with:
           freshness_diagnostics: 'true'
           prediction_mode: forecast
+          prediction_target: ${{ inputs.prediction_target }}
+          export_to_bigquery: 'false'
           prediction_throttle_s: ${{ inputs.prediction_throttle_s }}
           interval: ${{ inputs.interval }}
           debug: 'true'
@@ -116,6 +126,8 @@ jobs:
           REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
           FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
           PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
+          PREDICTION_TARGET: ${{ steps.watcher.outputs.prediction_target }}
+          REQUESTED_TARGET: ${{ inputs.prediction_target }}
           PREDICTION_THROTTLE_S: ${{ steps.watcher.outputs.prediction_throttle_s }}
           EXPORT_BQ: ${{ steps.watcher.outputs.export_to_bigquery }}
           RUN_ID: ${{ steps.watcher.outputs.run_id }}
@@ -126,6 +138,7 @@ jobs:
           test "$REMOTE" = "true"
           test "$FRESHNESS" = "true"
           test "${PREDICTION_MODE:-disabled}" = "forecast"
+          test "${PREDICTION_TARGET:-memory}" = "$REQUESTED_TARGET"
           test "${PREDICTION_THROTTLE_S:-}" = "${{ inputs.prediction_throttle_s }}"
           test "$EXPORT_BQ" = "false"
           test -n "$RUN_ID"
@@ -176,23 +189,49 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Verify backend process_forecasts
+      - name: Verify requested backend forecast target
         env:
           BPW_RUN_ID: ${{ needs.build.outputs.bpw_run_id }}
+          PREDICTION_TARGET: ${{ inputs.prediction_target }}
           BACKEND_URL: ${{ needs.build.outputs.backend_url }}
           FRONTEND_URL: ${{ needs.build.outputs.frontend_url }}
         run: |
           set -euo pipefail
-          run_json="$RUNNER_TEMP/forecast-run.json"
+          run_json="$RUNNER_TEMP/predict-run.json"
           verified=false
 
           for attempt in {1..36}; do
             if curl --fail --silent --show-error "$BACKEND_URL/runs/$BPW_RUN_ID" > "$run_json"; then
-              if jq -e '
+              if jq --arg target "$PREDICTION_TARGET" -e '
                 .finished == true
                 and (.samples | type == "array" and length > 0)
                 and ((.prediction_checkpoints // []) | length == 0)
-                and ((.process_forecasts // []) | length > 0)
+                and (.prediction_mode // "disabled") == "forecast"
+                and (.prediction_target // "memory") == $target
+                and (if $target == "class_loading" then
+                  ((.process_forecasts // []) | length == 0)
+                  and ([.process_activity_forecasts[]? | select(.status == "ready")] | length > 0)
+                  and all(.process_activity_forecasts[]? | select(.status == "ready");
+                    . as $f
+                    | ($f.process_name == "GradleDaemon" or $f.process_name == "KotlinCompileDaemon")
+                    and ($f.pid | type == "string" and length > 0)
+                    and $f.metric == "classes_loaded"
+                    and $f.method == "ai_forecast"
+                    and (($f.fallback // false) == false)
+                    and ($f.model_version | type == "string" and length > 0)
+                    and ($f.created_at_ms | type == "number")
+                    and ($f.origin_value_count | type == "number")
+                    and (($f.points // []) | length == 1)
+                    and all($f.points[];
+                      .target_at_ms == ($f.created_at_ms + 60000)
+                      and (.predicted_delta_count | type == "number")
+                      and .predicted_delta_count >= 0
+                      and (.predicted_total_count | type == "number")
+                      and ((.predicted_total_count - $f.origin_value_count - .predicted_delta_count) | fabs) < 0.000001
+                    )
+                  )
+                else
+                  ((.process_forecasts // []) | length > 0)
                 and ([.process_forecasts[] | . as $f | select(
                   ($f.process_name | type == "string")
                   and ($f.pid | type == "string")
@@ -205,6 +244,7 @@ jobs:
                     and (.target_at_ms >= $f.created_at_ms)
                   )
                 )] | length) == (.process_forecasts | length)
+                end)
               ' "$run_json" > /dev/null; then
                 verified=true
                 break
@@ -215,30 +255,39 @@ jobs:
           done
 
           if [ "$verified" != true ]; then
-            echo "No finalized process_forecasts for $BPW_RUN_ID."
+            echo "No finalized $PREDICTION_TARGET model forecasts for $BPW_RUN_ID."
             jq '{
               finished,
               sample_count: (.samples | length),
               prediction_checkpoints: (.prediction_checkpoints // [] | length),
-              process_forecasts: [.process_forecasts[]? | {process_name, pid, metric, created_at_ms, points: (.points|length)}]
+              process_forecasts: [.process_forecasts[]? | {process_name, pid, metric, created_at_ms, points: (.points|length)}],
+              process_activity_forecasts: [.process_activity_forecasts[]? | {process_name, pid, status, method, model_version}]
             }' "$run_json" || true
             exit 1
           fi
 
-          summary="$(jq -c '{
+          summary="$(jq --arg target "$PREDICTION_TARGET" -c '
+            (if $target == "class_loading" then [.process_activity_forecasts[]? | select(.status == "ready")] else .process_forecasts end) as $forecasts |
+            {
             finished,
             sample_count: (.samples | length),
-            forecast_count: (.process_forecasts | length),
-            metrics: [.process_forecasts[] | .metric] | unique,
-            processes: [.process_forecasts[] | .process_name] | unique,
-            checkpoints: (.prediction_checkpoints // [] | length)
+            prediction_target: $target,
+            forecast_count: ($forecasts | length),
+            metrics: [$forecasts[] | .metric] | unique,
+            processes: [$forecasts[] | .process_name] | unique,
+            checkpoints: (.prediction_checkpoints // [] | length),
+            methods: [$forecasts[] | .method // "unknown"] | unique,
+            models: [$forecasts[] | .model_version // "unknown"] | unique
           }' "$run_json")"
           echo "Forecast summary: $summary"
 
           dashboard_url="${FRONTEND_URL%/}/runs/$BPW_RUN_ID"
           echo "## Forecast smoke"
           echo "- Run: [$BPW_RUN_ID]($dashboard_url)"
+          echo "- Prediction target: $PREDICTION_TARGET"
           echo "- Forecast issuances: $(jq -r '.forecast_count' <<<"$summary")"
           echo "- Processes: $(jq -r '.processes | join(", ")' <<<"$summary")"
           echo "- Metrics: $(jq -r '.metrics | join(", ")' <<<"$summary")"
+          echo "- Methods: $(jq -r '.methods | join(", ")' <<<"$summary")"
+          echo "- Models: $(jq -r '.models | join(", ")' <<<"$summary")"
           echo "- Reliability checkpoints: $(jq -r '.checkpoints' <<<"$summary") (expect 0)"
