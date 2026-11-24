@@ -150,7 +150,7 @@ jobs:
           echo "bpw_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
           echo "backend_url=$BACKEND_URL" >> "$GITHUB_OUTPUT"
           echo "frontend_url=$FRONTEND_URL" >> "$GITHUB_OUTPUT"
-          mkdir -p predict-runs
+          mkdir -p bqml-boosted-runs
           jq -n \
             --arg label "${{ inputs.experiment_ref }}" \
             --arg run_id "$RUN_ID" \
