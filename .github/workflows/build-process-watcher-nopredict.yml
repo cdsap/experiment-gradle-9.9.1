@@ -1,4 +1,5 @@
 name: Build Process Watcher no-predict smoke
+run-name: Collector comparison · ${{ inputs.experiment_ref }} · ${{ inputs.action_ref }}
 
 on:
   workflow_dispatch:
@@ -45,8 +46,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      workload_commit: ${{ steps.commits.outputs.workload }}
+      action_commit: ${{ steps.commits.outputs.action }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.experiment_ref }}
+          path: workload
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: cdsap/build-process-watcher
+          ref: ${{ inputs.action_ref }}
+          path: bpw-action
+          persist-credentials: false
+      - id: commits
+        run: |
+          echo "workload=$(git -C workload rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "action=$(git -C bpw-action rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build:
-    name: Live no-predict ${{ inputs.experiment_ref }}
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        collector: [shell, daemonitor]
+    env:
+      DAEMONITOR_COMMIT: d47b3901277ae0f3d858286c1e884ec35aa0d4ae
+    name: Gradle 9.9 · ${{ matrix.collector }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
@@ -58,14 +88,16 @@ jobs:
       - name: Check out experiment
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.experiment_ref }}
+          ref: ${{ needs.resolve.outputs.workload_commit }}
+          persist-credentials: false
 
       - name: Check out Build Process Watcher
         uses: actions/checkout@v4
         with:
           repository: cdsap/build-process-watcher
-          ref: ${{ inputs.action_ref }}
+          ref: ${{ needs.resolve.outputs.action_commit }}
           path: bpw-action
+          persist-credentials: false
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -88,6 +120,19 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+
+      - name: Set up Go for Daemonitor
+        if: matrix.collector == 'daemonitor'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+          cache: false
+
+      - name: Build pinned Daemonitor from source
+        if: matrix.collector == 'daemonitor'
+        run: bash bpw-action/scripts/build-daemonitor.sh "$DAEMONITOR_COMMIT" "$RUNNER_TEMP/daemonitor-bin"
 
       - name: Prepare configured GC log directory
         run: mkdir -p /home/runner/work/Telltale/Telltale
@@ -99,13 +144,18 @@ jobs:
           BACKEND_URL: ${{ inputs.backend_url }}
           FRONTEND_URL: ${{ inputs.frontend_url }}
         with:
+          collector: ${{ matrix.collector }}
+          daemonitor_bin_dir: ${{ runner.temp }}/daemonitor-bin
+          daemonitor_source_commit: ${{ env.DAEMONITOR_COMMIT }}
           freshness_diagnostics: 'true'
           interval: ${{ inputs.interval }}
           debug: 'true'
-          run_id: nopredict-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.experiment_ref }}
+          run_id: collectors-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.collector }}
 
       - name: Assert no-predict remote mode
         env:
+          COLLECTOR: ${{ steps.watcher.outputs.collector }}
+          EXPECTED_COLLECTOR: ${{ matrix.collector }}
           REMOTE: ${{ steps.watcher.outputs.remote_monitoring }}
           FRESHNESS: ${{ steps.watcher.outputs.freshness_diagnostics }}
           PREDICTION_MODE: ${{ steps.watcher.outputs.prediction_mode }}
@@ -115,6 +165,7 @@ jobs:
           FRONTEND_URL: ${{ steps.watcher.outputs.frontend_url }}
         run: |
           set -euo pipefail
+          test "$COLLECTOR" = "$EXPECTED_COLLECTOR"
           test "$REMOTE" = "true"
           test "$FRESHNESS" = "true"
           test "${PREDICTION_MODE:-disabled}" = "disabled"
@@ -144,17 +195,20 @@ jobs:
           mkdir -p nopredict-runs
           jq -n \
             --arg label "${{ inputs.experiment_ref }}" \
+            --arg collector "${{ matrix.collector }}" \
+            --arg action_commit "${{ needs.resolve.outputs.action_commit }}" \
+            --arg workload_commit "${{ needs.resolve.outputs.workload_commit }}" \
             --arg run_id "$RUN_ID" \
             --arg backend_url "$BACKEND_URL" \
             --arg frontend_url "$FRONTEND_URL" \
-            '{label: $label, run_id: $run_id, backend_url: $backend_url, frontend_url: $frontend_url}' \
+            '{label: $label, collector: $collector, action_commit: $action_commit, workload_commit: $workload_commit, run_id: $run_id, backend_url: $backend_url, frontend_url: $frontend_url}' \
             > nopredict-runs/run.json
 
       - name: Upload Build Process Watcher run
         if: always() && steps.watcher.outputs.run_id != ''
         uses: actions/upload-artifact@v4
         with:
-          name: nopredict-run-${{ inputs.experiment_ref }}
+          name: collector-run-${{ inputs.experiment_ref }}-${{ matrix.collector }}
           path: nopredict-runs/run.json
           if-no-files-found: error
           retention-days: 7
