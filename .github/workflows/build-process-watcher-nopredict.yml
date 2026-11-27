@@ -75,7 +75,7 @@ jobs:
       matrix:
         collector: [shell, daemonitor]
     env:
-      DAEMONITOR_COMMIT: d47b3901277ae0f3d858286c1e884ec35aa0d4ae
+      DAEMONITOR_VERSION: '1.3.3'
     name: Gradle 9.9 · ${{ matrix.collector }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -123,16 +123,21 @@ jobs:
         with:
           cache-disabled: true
 
-      - name: Set up Go for Daemonitor
+      - name: Install Daemonitor CLI from Homebrew
+        id: daemonitor
         if: matrix.collector == 'daemonitor'
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.2'
-          cache: false
-
-      - name: Build pinned Daemonitor from source
-        if: matrix.collector == 'daemonitor'
-        run: bash bpw-action/scripts/build-daemonitor.sh "$DAEMONITOR_COMMIT" "$RUNNER_TEMP/daemonitor-bin"
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install cdsap/tap/daemonitor-cli
+          installed=$(brew list --versions cdsap/tap/daemonitor-cli)
+          if [[ "$installed" != "daemonitor-cli $DAEMONITOR_VERSION" ]]; then
+            echo "Expected Daemonitor $DAEMONITOR_VERSION, installed: $installed" >&2
+            exit 1
+          fi
+          bin_dir="$(brew --prefix cdsap/tap/daemonitor-cli)/bin"
+          test -x "$bin_dir/daemonitor-cli"
+          test -x "$bin_dir/daemonitor-cored"
+          echo "bin_dir=$bin_dir" >> "$GITHUB_OUTPUT"
 
       - name: Prepare configured GC log directory
         run: mkdir -p /home/runner/work/Telltale/Telltale
@@ -145,8 +150,7 @@ jobs:
           FRONTEND_URL: ${{ inputs.frontend_url }}
         with:
           collector: ${{ matrix.collector }}
-          daemonitor_bin_dir: ${{ runner.temp }}/daemonitor-bin
-          daemonitor_source_commit: ${{ env.DAEMONITOR_COMMIT }}
+          daemonitor_bin_dir: ${{ steps.daemonitor.outputs.bin_dir }}
           freshness_diagnostics: 'true'
           interval: ${{ inputs.interval }}
           debug: 'true'
